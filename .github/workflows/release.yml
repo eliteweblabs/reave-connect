@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Zip plugin
+        run: |
+          mkdir -p dist/reave-connect
+          cp reave-connect.php dist/reave-connect/
+          (cd dist && zip -r reave-connect.zip reave-connect)
+
+      - name: Delete old latest release and tag
+        run: |
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create new latest release
+        run: |
+          gh release create latest dist/reave-connect.zip \
+            --title "REΛVE Connect — latest" \
+            --notes "Latest build from main. WordPress sites update from https://reave.app/api/wp-update/reave-connect/" \
+            --latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
