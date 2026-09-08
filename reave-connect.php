@@ -2,8 +2,8 @@
 /**
  * Plugin Name:  Reave Connect
  * Plugin URI:   https://reave.app/
- * Description:  Secure REST API bridge for remote WordPress management via Reave Automation. Supports posts, pages, media, plugin install/activate, option updates, and auto-updates from reave.app.
- * Version:      1.2.0
+ * Description:  Secure REST API bridge for remote WordPress management via Reave Automation. Supports posts, pages, media, plugin install/activate, option updates, head-script injection, and auto-updates from reave.app.
+ * Version:      1.3.0
  * Author:       Elite Web Labs
  * Author URI:   https://eliteweblabs.com/
  * License:      GPL-2.0+
@@ -13,7 +13,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'REAVE_CONNECT_VERSION', '1.2.0' );
+define( 'REAVE_CONNECT_VERSION', '1.3.0' );
 define( 'REAVE_CONNECT_UPDATE_URL', 'https://reave.app/api/wp-update/reave-connect' );
 
 // ---------------------------------------------------------------------------
@@ -84,7 +84,107 @@ function reave_connect_fetch_update_info(): ?array {
 }
 
 // ---------------------------------------------------------------------------
-// 2. REST API endpoint: /wp-json/reave/v1/exec
+// 2. Head-script injection via wp_head (stored in wp_options)
+// ---------------------------------------------------------------------------
+
+// Option name for the array of named head scripts: reave_head_scripts
+// Structure: [ 'handle' => 'plausible', 'html' => '<script ...>', 'added' => '2026-...' ]
+
+add_action( 'wp_head', 'reave_connect_output_head_scripts', 1 );
+function reave_connect_output_head_scripts(): void {
+    $scripts = get_option( 'reave_head_scripts', [] );
+    if ( ! is_array( $scripts ) || empty( $scripts ) ) return;
+    foreach ( $scripts as $entry ) {
+        if ( ! empty( $entry['html'] ) ) {
+            echo "\n" . $entry['html'] . "\n";
+        }
+    }
+}
+
+function reave_connect_inject_head_script( array $params ): WP_REST_Response {
+    $handle = sanitize_key( (string) ( $params['handle'] ?? '' ) );
+    $html   = (string) ( $params['html'] ?? '' );
+
+    if ( ! $handle ) {
+        return new WP_REST_Response( [ 'ok' => false, 'error' => 'handle is required (e.g. "plausible")' ], 400 );
+    }
+    if ( ! $html ) {
+        return new WP_REST_Response( [ 'ok' => false, 'error' => 'html is required' ], 400 );
+    }
+
+    $scripts = get_option( 'reave_head_scripts', [] );
+    if ( ! is_array( $scripts ) ) $scripts = [];
+
+    // Replace existing entry with same handle, or append
+    $found = false;
+    foreach ( $scripts as &$entry ) {
+        if ( isset( $entry['handle'] ) && $entry['handle'] === $handle ) {
+            $entry['html']    = $html;
+            $entry['updated'] = current_time( 'c' );
+            $found = true;
+            break;
+        }
+    }
+    unset( $entry );
+
+    if ( ! $found ) {
+        $scripts[] = [
+            'handle' => $handle,
+            'html'   => $html,
+            'added'  => current_time( 'c' ),
+        ];
+    }
+
+    update_option( 'reave_head_scripts', $scripts, false );
+
+    return new WP_REST_Response( [
+        'ok'     => true,
+        'handle' => $handle,
+        'action' => $found ? 'updated' : 'added',
+        'total'  => count( $scripts ),
+    ], 200 );
+}
+
+function reave_connect_get_head_scripts( array $params ): WP_REST_Response {
+    $scripts = get_option( 'reave_head_scripts', [] );
+    if ( ! is_array( $scripts ) ) $scripts = [];
+
+    $handle = sanitize_key( (string) ( $params['handle'] ?? '' ) );
+    if ( $handle ) {
+        foreach ( $scripts as $entry ) {
+            if ( isset( $entry['handle'] ) && $entry['handle'] === $handle ) {
+                return new WP_REST_Response( [ 'ok' => true, 'script' => $entry ], 200 );
+            }
+        }
+        return new WP_REST_Response( [ 'ok' => false, 'error' => "No script with handle '{$handle}'" ], 404 );
+    }
+
+    return new WP_REST_Response( [ 'ok' => true, 'scripts' => $scripts, 'total' => count( $scripts ) ], 200 );
+}
+
+function reave_connect_remove_head_script( array $params ): WP_REST_Response {
+    $handle = sanitize_key( (string) ( $params['handle'] ?? '' ) );
+    if ( ! $handle ) {
+        return new WP_REST_Response( [ 'ok' => false, 'error' => 'handle is required' ], 400 );
+    }
+
+    $scripts = get_option( 'reave_head_scripts', [] );
+    if ( ! is_array( $scripts ) ) $scripts = [];
+
+    $filtered = array_values( array_filter( $scripts, fn( $e ) => ( $e['handle'] ?? '' ) !== $handle ) );
+    $removed  = count( $scripts ) - count( $filtered );
+
+    update_option( 'reave_head_scripts', $filtered, false );
+
+    return new WP_REST_Response( [
+        'ok'      => true,
+        'removed' => $removed,
+        'handle'  => $handle,
+    ], 200 );
+}
+
+// ---------------------------------------------------------------------------
+// 3. REST API endpoint: /wp-json/reave/v1/exec
 // ---------------------------------------------------------------------------
 
 add_action( 'rest_api_init', function () {
@@ -107,7 +207,6 @@ function reave_connect_auth( WP_REST_Request $request ): bool {
 
     $provided = $request->get_header( 'X-Reave-Key' );
     if ( ! $provided ) {
-        // Also allow query param for testing
         $provided = $request->get_param( 'key' );
     }
 
@@ -170,6 +269,19 @@ function reave_connect_exec( WP_REST_Request $request ): WP_REST_Response {
     }
 
     switch ( $action ) {
+
+        // --- Head Script Injection ---
+        case 'inject_head_script':
+            reave_connect_ensure_admin();
+            return reave_connect_inject_head_script( $params );
+
+        case 'get_head_script':
+        case 'get_head_scripts':
+            return reave_connect_get_head_scripts( $params );
+
+        case 'remove_head_script':
+            reave_connect_ensure_admin();
+            return reave_connect_remove_head_script( $params );
 
         // --- Options ---
         case 'get_option':
@@ -243,9 +355,6 @@ function reave_connect_exec( WP_REST_Request $request ): WP_REST_Response {
             return new WP_REST_Response( [ 'ok' => true, 'deactivated' => $slug ], 200 );
 
         case 'install_plugin':
-            if ( ! current_user_can( 'install_plugins' ) ) {
-                // Run as admin — bypass capability check via temp filter
-            }
             require_once ABSPATH . 'wp-admin/includes/plugin.php';
             require_once ABSPATH . 'wp-admin/includes/file.php';
             require_once ABSPATH . 'wp-admin/includes/misc.php';
@@ -255,7 +364,6 @@ function reave_connect_exec( WP_REST_Request $request ): WP_REST_Response {
             $plugin_slug = sanitize_text_field( $params['slug'] ?? '' );
             $activate    = filter_var( $params['activate'] ?? true, FILTER_VALIDATE_BOOLEAN );
 
-            // Fetch plugin info from WordPress.org
             include_once ABSPATH . 'wp-admin/includes/plugin-install.php';
             $api = plugins_api( 'plugin_information', [
                 'slug'   => $plugin_slug,
@@ -266,7 +374,6 @@ function reave_connect_exec( WP_REST_Request $request ): WP_REST_Response {
                 return new WP_REST_Response( [ 'ok' => false, 'error' => $api->get_error_message() ], 400 );
             }
 
-            // Suppress output during install
             ob_start();
             $skin     = new WP_Ajax_Upgrader_Skin();
             $upgrader = new Plugin_Upgrader( $skin );
@@ -297,7 +404,7 @@ function reave_connect_exec( WP_REST_Request $request ): WP_REST_Response {
                 'version' => $theme->get( 'Version' ),
             ], 200 );
 
-        // --- Cache (common plugins) ---
+        // --- Cache ---
         case 'flush_cache':
             return new WP_REST_Response( reave_connect_flush_cache(), 200 );
 
@@ -588,6 +695,7 @@ function reave_connect_exec( WP_REST_Request $request ): WP_REST_Response {
                 'ok'    => false,
                 'error' => "Unknown action: {$action}",
                 'valid_actions' => [
+                    'inject_head_script', 'get_head_script', 'get_head_scripts', 'remove_head_script',
                     'get_option', 'update_option',
                     'enable_indexing', 'disable_indexing', 'get_indexing_status',
                     'list_plugins', 'activate_plugin', 'deactivate_plugin', 'install_plugin',
@@ -602,375 +710,3 @@ function reave_connect_exec( WP_REST_Request $request ): WP_REST_Response {
             ], 400 );
     }
 }
-
-// ---------------------------------------------------------------------------
-// 3. Settings page — store API key in DB as fallback (wp-config.php preferred)
-// ---------------------------------------------------------------------------
-
-add_action( 'admin_menu', function () {
-    add_options_page(
-        'Reave Connect',
-        'Reave Connect',
-        'manage_options',
-        'reave-connect',
-        'reave_connect_settings_page'
-    );
-} );
-
-function reave_connect_settings_page() {
-    if ( isset( $_POST['reave_api_key'] ) && check_admin_referer( 'reave_connect_save' ) ) {
-        update_option( 'reave_api_key', sanitize_text_field( $_POST['reave_api_key'] ) );
-        echo '<div class="notice notice-success"><p>API key saved.</p></div>';
-    }
-    $key = defined( 'REAVE_API_KEY' ) ? '(set via wp-config.php constant)' : esc_attr( get_option( 'reave_api_key', '' ) );
-    ?>
-    <div class="wrap">
-        <h1>Reave Connect</h1>
-        <p>This plugin allows <a href="https://reave.app/" target="_blank">Reave Automation</a> to manage this WordPress site remotely — posts, pages, media, plugins, cache, and options.</p>
-        <form method="post">
-            <?php wp_nonce_field( 'reave_connect_save' ); ?>
-            <table class="form-table">
-                <tr>
-                    <th><label for="reave_api_key">API Key</label></th>
-                    <td>
-                        <input type="text" name="reave_api_key" id="reave_api_key"
-                               value="<?php echo $key; ?>" class="regular-text"
-                               <?php echo defined( 'REAVE_API_KEY' ) ? 'disabled' : ''; ?> />
-                        <p class="description">
-                            Recommended: define <code>REAVE_API_KEY</code> in <code>wp-config.php</code> instead.<br>
-                            Endpoint: <code><?php echo esc_html( get_site_url() ); ?>/wp-json/reave/v1/exec</code>
-                        </p>
-                    </td>
-                </tr>
-            </table>
-            <?php if ( ! defined( 'REAVE_API_KEY' ) ) submit_button( 'Save API Key' ); ?>
-        </form>
-    </div>
-    <?php
-}
-
-function reave_connect_option_blocked( string $key ): bool {
-    $blocked = [
-        'auth_key', 'secure_auth_key', 'logged_in_key', 'nonce_key',
-        'auth_salt', 'secure_auth_salt', 'logged_in_salt', 'nonce_salt',
-        'reave_api_key',
-    ];
-    return in_array( sanitize_key( $key ), $blocked, true );
-}
-
-function reave_connect_flat_meta( int $id ): array {
-    $raw = get_post_meta( $id );
-    $out = [];
-    foreach ( $raw as $key => $values ) {
-        if ( strpos( (string) $key, '_acf_changed' ) === 0 ) continue;
-        $val = count( $values ) === 1 ? $values[0] : $values;
-        if ( is_string( $val ) && is_serialized( $val ) ) {
-            $un = @unserialize( $val );
-            if ( $un !== false ) $val = $un;
-        }
-        $out[ $key ] = $val;
-    }
-    return $out;
-}
-
-function reave_connect_health(): array {
-    if ( ! function_exists( 'get_plugins' ) ) {
-        require_once ABSPATH . 'wp-admin/includes/plugin.php';
-    }
-    $all = get_plugins();
-    $active = get_option( 'active_plugins', [] );
-    $plugins = [];
-    foreach ( $all as $file => $data ) {
-        $plugins[] = [
-            'file'    => $file,
-            'name'    => $data['Name'],
-            'version' => $data['Version'],
-            'active'  => in_array( $file, $active, true ),
-        ];
-    }
-    global $wpdb;
-    $theme = wp_get_theme();
-    return [
-        'ok'           => true,
-        'site_url'     => get_site_url(),
-        'site_name'    => get_bloginfo( 'name' ),
-        'tagline'      => get_bloginfo( 'description' ),
-        'wp_version'   => get_bloginfo( 'version' ),
-        'php_version'  => PHP_VERSION,
-        'db_version'   => $wpdb->db_version(),
-        'theme'        => $theme->get( 'Name' ),
-        'timezone'     => get_option( 'timezone_string' ) ?: get_option( 'gmt_offset' ),
-        'language'     => get_bloginfo( 'language' ),
-        'plugins'      => $plugins,
-        'memory_limit' => defined( 'WP_MEMORY_LIMIT' ) ? WP_MEMORY_LIMIT : '',
-        'debug_mode'   => defined( 'WP_DEBUG' ) && WP_DEBUG,
-        'plugin_version' => REAVE_CONNECT_VERSION,
-    ];
-}
-
-function reave_connect_flush_cache(): array {
-    $flushed = [];
-    if ( function_exists( 'wp_cache_flush' ) && wp_cache_flush() ) $flushed[] = 'Object Cache';
-    global $wpdb;
-    $transients = $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_%'" );
-    $flushed[] = "Transients ({$transients})";
-    if ( function_exists( 'kinsta_cache_purge' ) ) { kinsta_cache_purge(); $flushed[] = 'Kinsta'; }
-    if ( function_exists( 'w3tc_flush_all' ) ) { w3tc_flush_all(); $flushed[] = 'W3 Total Cache'; }
-    if ( function_exists( 'rocket_clean_domain' ) ) { rocket_clean_domain(); $flushed[] = 'WP Rocket'; }
-    if ( function_exists( 'sg_cachepress_purge_cache' ) ) { sg_cachepress_purge_cache(); $flushed[] = 'SG Optimizer'; }
-    if ( function_exists( 'wp_cache_clear_cache' ) ) { wp_cache_clear_cache(); $flushed[] = 'WP Super Cache'; }
-    if ( class_exists( 'LiteSpeed_Cache_API' ) ) { LiteSpeed_Cache_API::purge_all(); $flushed[] = 'LiteSpeed'; }
-    return [ 'ok' => true, 'flushed' => $flushed ];
-}
-
-function reave_connect_search_replace( array $params ): WP_REST_Response {
-    global $wpdb;
-    $search  = (string) ( $params['search'] ?? '' );
-    $replace = (string) ( $params['replace'] ?? '' );
-    $dry_run = array_key_exists( 'dry_run', $params )
-        ? filter_var( $params['dry_run'], FILTER_VALIDATE_BOOLEAN )
-        : true;
-    $tables  = is_array( $params['tables'] ?? null ) ? $params['tables'] : [];
-    if ( $search === '' ) {
-        return new WP_REST_Response( [ 'ok' => false, 'error' => 'search cannot be empty' ], 400 );
-    }
-    if ( empty( $tables ) ) {
-        $tables = [ $wpdb->posts, $wpdb->postmeta, $wpdb->options, $wpdb->comments, $wpdb->commentmeta, $wpdb->terms, $wpdb->termmeta ];
-    }
-    $report = [];
-    foreach ( $tables as $table ) {
-        $table = preg_replace( '/[^a-zA-Z0-9_]/', '', (string) $table );
-        $exists = $wpdb->get_var( $wpdb->prepare(
-            'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s AND table_name = %s',
-            DB_NAME,
-            $table
-        ) );
-        if ( ! $exists ) {
-            $report[ $table ] = 'skipped — table not found';
-            continue;
-        }
-        $columns = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`", ARRAY_A );
-        $count = 0;
-        foreach ( $columns as $col ) {
-            $col_name = $col['Field'];
-            if ( ! preg_match( '/char|text|blob/', strtolower( $col['Type'] ) ) ) continue;
-            $matches = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM `{$table}` WHERE `{$col_name}` LIKE %s",
-                '%' . $wpdb->esc_like( $search ) . '%'
-            ) );
-            if ( $matches < 1 ) continue;
-            $count += $matches;
-            if ( $dry_run ) continue;
-            $rows = $wpdb->get_results( $wpdb->prepare(
-                "SELECT * FROM `{$table}` WHERE `{$col_name}` LIKE %s",
-                '%' . $wpdb->esc_like( $search ) . '%'
-            ), ARRAY_A );
-            $pk_row = $wpdb->get_row( "SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY'", ARRAY_A );
-            $pk = $pk_row['Column_name'] ?? null;
-            foreach ( $rows as $row ) {
-                $old = $row[ $col_name ];
-                $new = reave_connect_recursive_replace( $search, $replace, $old );
-                if ( $new !== $old && $pk && isset( $row[ $pk ] ) ) {
-                    $wpdb->update( $table, [ $col_name => $new ], [ $pk => $row[ $pk ] ] );
-                }
-            }
-        }
-        $report[ $table ] = [ 'rows_matched' => $count, 'updated' => $dry_run ? 'dry run' : $count ];
-    }
-    return new WP_REST_Response( [
-        'ok'      => true,
-        'dry_run' => $dry_run,
-        'search'  => $search,
-        'replace' => $dry_run ? '(not applied)' : $replace,
-        'tables'  => $report,
-    ], 200 );
-}
-
-function reave_connect_recursive_replace( $search, $replace, $data ) {
-    if ( is_array( $data ) ) {
-        foreach ( $data as $key => $value ) {
-            $data[ $key ] = reave_connect_recursive_replace( $search, $replace, $value );
-        }
-        return $data;
-    }
-    if ( is_serialized( $data ) ) {
-        $unserialized = @unserialize( $data );
-        if ( $unserialized !== false ) {
-            return serialize( reave_connect_recursive_replace( $search, $replace, $unserialized ) );
-        }
-    }
-    return is_string( $data ) ? str_replace( $search, $replace, $data ) : $data;
-}
-
-function reave_connect_list_menus(): array {
-    $menus = wp_get_nav_menus();
-    $locations = get_nav_menu_locations();
-    $loc_map = array_flip( $locations );
-    $out = [];
-    foreach ( $menus as $menu ) {
-        $out[] = [
-            'id'       => $menu->term_id,
-            'name'     => $menu->name,
-            'slug'     => $menu->slug,
-            'count'    => $menu->count,
-            'location' => $loc_map[ $menu->term_id ] ?? null,
-        ];
-    }
-    return $out;
-}
-
-function reave_connect_get_menu_items( int $menu_id ): ?array {
-    if ( ! $menu_id ) return null;
-    $items = wp_get_nav_menu_items( $menu_id, [ 'update_post_term_cache' => false ] );
-    if ( $items === false ) return null;
-    $out = [];
-    foreach ( $items as $item ) {
-        $out[] = [
-            'id'        => (int) $item->ID,
-            'title'     => $item->title,
-            'url'       => $item->url,
-            'target'    => $item->target,
-            'parent'    => (int) $item->menu_item_parent,
-            'order'     => (int) $item->menu_order,
-            'object'    => $item->object,
-            'object_id' => (int) $item->object_id,
-            'type'      => $item->type,
-        ];
-    }
-    return $out;
-}
-
-function reave_connect_update_menu_item( array $params ): WP_REST_Response {
-    $menu_id = (int) ( $params['menu_id'] ?? $params['id'] ?? 0 );
-    $item_id = (int) ( $params['item_id'] ?? 0 );
-    $items = reave_connect_get_menu_items( $menu_id );
-    if ( $items === null ) {
-        return new WP_REST_Response( [ 'ok' => false, 'error' => 'Menu not found' ], 404 );
-    }
-    $existing_items = wp_get_nav_menu_items( $menu_id, [ 'update_post_term_cache' => false ] );
-    $existing = null;
-    foreach ( $existing_items ?: [] as $item ) {
-        if ( (int) $item->ID === $item_id ) { $existing = $item; break; }
-    }
-    if ( ! $existing ) {
-        return new WP_REST_Response( [ 'ok' => false, 'error' => 'Menu item not found' ], 404 );
-    }
-    $args = [
-        'menu-item-title'     => isset( $params['title'] ) ? sanitize_text_field( $params['title'] ) : $existing->title,
-        'menu-item-url'       => isset( $params['url'] ) ? esc_url_raw( $params['url'] ) : $existing->url,
-        'menu-item-target'    => isset( $params['target'] ) ? sanitize_text_field( $params['target'] ) : $existing->target,
-        'menu-item-status'    => 'publish',
-        'menu-item-position'  => $existing->menu_order,
-        'menu-item-parent-id' => $existing->menu_item_parent,
-        'menu-item-object'    => $existing->object,
-        'menu-item-object-id' => $existing->object_id,
-        'menu-item-type'      => $existing->type,
-    ];
-    $result = wp_update_nav_menu_item( $menu_id, $item_id, $args );
-    if ( is_wp_error( $result ) ) {
-        return new WP_REST_Response( [ 'ok' => false, 'error' => $result->get_error_message() ], 400 );
-    }
-    return new WP_REST_Response( [ 'ok' => true, 'item_id' => $item_id ], 200 );
-}
-
-function reave_connect_has_redirection(): bool {
-    return class_exists( 'Red_Item' );
-}
-
-function reave_connect_list_redirects(): array {
-    global $wpdb;
-    if ( reave_connect_has_redirection() ) {
-        $table = $wpdb->prefix . 'redirection_items';
-        $rows = $wpdb->get_results( "SELECT id, url AS `from`, action_data AS `to`, action_code AS code, status FROM {$table} ORDER BY id DESC LIMIT 200", ARRAY_A );
-        return $rows ?: [];
-    }
-    reave_connect_ensure_redirect_table();
-    $table = $wpdb->prefix . 'reave_redirects';
-    $rows = $wpdb->get_results( "SELECT id, from_url AS `from`, to_url AS `to`, code, created_at FROM {$table} ORDER BY id DESC", ARRAY_A );
-    return $rows ?: [];
-}
-
-function reave_connect_create_redirect( array $params ): WP_REST_Response {
-    global $wpdb;
-    $from = (string) ( $params['from'] ?? $params['source'] ?? '' );
-    $to = (string) ( $params['to'] ?? $params['target'] ?? '' );
-    if ( $from === '' || $to === '' ) {
-        return new WP_REST_Response( [ 'ok' => false, 'error' => 'from and to are required' ], 400 );
-    }
-    $from = '/' . ltrim( $from, '/' );
-    $code = (int) ( $params['code'] ?? 301 );
-    if ( ! in_array( $code, [ 301, 302, 307, 308 ], true ) ) $code = 301;
-
-    if ( reave_connect_has_redirection() ) {
-        $item = Red_Item::create( [
-            'url'         => $from,
-            'action_data' => [ 'url' => $to ],
-            'action_code' => $code,
-            'action_type' => 'url',
-            'match_type'  => 'url',
-            'group_id'    => 1,
-        ] );
-        if ( is_wp_error( $item ) ) {
-            return new WP_REST_Response( [ 'ok' => false, 'error' => $item->get_error_message() ], 400 );
-        }
-        return new WP_REST_Response( [ 'ok' => true, 'id' => $item->get_id(), 'from' => $from, 'to' => $to, 'code' => $code ], 200 );
-    }
-
-    reave_connect_ensure_redirect_table();
-    $table = $wpdb->prefix . 'reave_redirects';
-    $wpdb->insert( $table, [
-        'from_url'   => $from,
-        'to_url'     => $to,
-        'code'       => $code,
-        'created_at' => current_time( 'mysql' ),
-    ] );
-    return new WP_REST_Response( [ 'ok' => true, 'id' => (int) $wpdb->insert_id, 'from' => $from, 'to' => $to, 'code' => $code ], 200 );
-}
-
-function reave_connect_delete_redirect( int $id ): WP_REST_Response {
-    global $wpdb;
-    if ( ! $id ) return new WP_REST_Response( [ 'ok' => false, 'error' => 'id is required' ], 400 );
-    if ( reave_connect_has_redirection() ) {
-        $item = Red_Item::get_by_id( $id );
-        if ( ! $item ) return new WP_REST_Response( [ 'ok' => false, 'error' => 'Redirect not found' ], 404 );
-        $item->delete();
-        return new WP_REST_Response( [ 'ok' => true, 'deleted' => $id ], 200 );
-    }
-    $table = $wpdb->prefix . 'reave_redirects';
-    $deleted = $wpdb->delete( $table, [ 'id' => $id ], [ '%d' ] );
-    if ( ! $deleted ) return new WP_REST_Response( [ 'ok' => false, 'error' => 'Redirect not found' ], 404 );
-    return new WP_REST_Response( [ 'ok' => true, 'deleted' => $id ], 200 );
-}
-
-function reave_connect_ensure_redirect_table(): void {
-    global $wpdb;
-    $table = $wpdb->prefix . 'reave_redirects';
-    $charset = $wpdb->get_charset_collate();
-    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-    dbDelta( "CREATE TABLE IF NOT EXISTS {$table} (
-        id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        from_url    VARCHAR(2048)   NOT NULL,
-        to_url      VARCHAR(2048)   NOT NULL,
-        code        SMALLINT        NOT NULL DEFAULT 301,
-        created_at  DATETIME        NOT NULL,
-        PRIMARY KEY (id)
-    ) {$charset};" );
-}
-
-function reave_connect_handle_redirect(): void {
-    global $wpdb;
-    $table = $wpdb->prefix . 'reave_redirects';
-    $exists = $wpdb->get_var( $wpdb->prepare(
-        'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s AND table_name = %s',
-        DB_NAME,
-        $table
-    ) );
-    if ( ! $exists ) return;
-    $path = parse_url( $_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH );
-    $row = $wpdb->get_row( $wpdb->prepare( "SELECT to_url, code FROM {$table} WHERE from_url = %s LIMIT 1", $path ) );
-    if ( $row ) {
-        wp_redirect( $row->to_url, (int) $row->code );
-        exit;
-    }
-}
-add_action( 'template_redirect', 'reave_connect_handle_redirect', 1 );
